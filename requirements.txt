@@ -1,0 +1,22 @@
+pytorch-lightning==1.5.4
+einops==0.3.2
+kornia==0.4.1
+opencv-python==4.5.3.56
+matplotlib
+jupyter
+imageio==2.9.0
+imageio-ffmpeg==0.4.2
+pillow==9.5.0
+torch_optimizer
+
+# for mesh
+PyMCubes==0.1.2
+trimesh==3.9.1
+
+# for point cloud
+plyfile==0.7.2
+open3d==0.13.0
+
+# for evaluate metrics
+scikit-image
+lpips

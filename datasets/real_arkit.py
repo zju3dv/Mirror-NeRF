@@ -1,0 +1,320 @@
+import torch
+from torch.utils.data import Dataset
+import json
+import numpy as np
+import os
+from PIL import Image
+from torchvision import transforms as T
+import cv2
+
+from .ray_utils import *
+from .geo_utils import *
+
+
+class RealDatasetARKit(Dataset):
+    def __init__(self, root_dir, split="train", img_wh=(800, 800), hparams=None):
+        self.root_dir = root_dir
+        self.split = split
+        self.img_wh = img_wh
+        self.hparams = hparams
+        self.define_transforms()
+        self.wo_full_gt_mirror_masks = False
+        self.train_geometry_stage = self.hparams.train_geometry_stage
+
+        self.read_meta()
+        self.white_back = False
+
+    def define_transforms(self):
+        self.transform = T.ToTensor()
+
+    def gather_poses(self, frames):
+        """
+        Outputs:
+            poses: (N_images, 4, 4)
+        """
+        poses = []
+        for frame in frames:
+            pose = np.array(frame["transform_matrix"])
+            poses.append(pose)
+        poses = np.stack(poses, axis=0)  # (N_images, 4, 4)
+        return poses
+
+    def read_meta(self):
+        with open(
+            os.path.join(self.root_dir, f"transforms_{self.split}.json"), "r"
+        ) as f:
+            self.meta = json.load(f)
+        with open(os.path.join(self.root_dir, f"transforms.json"), "r") as f:
+            self.meta_all = json.load(f)
+
+        w, h = self.img_wh
+        if "camera_angle_x" in self.meta:
+            self.focal = (
+                0.5 * 1920 / np.tan(0.5 * self.meta["camera_angle_x"])
+            )  # original focal length when W=800
+
+            self.focal *= (
+                self.img_wh[0] / 1920
+            )  # modify focal length to match size self.img_wh
+        else:
+            fx = (
+                self.meta["fx"]
+                if "fx" in self.meta
+                else self.meta["frames"][0]["intrinsics"][0][0]
+            )
+            self.focal = fx  # original focal length
+
+            cx = (
+                self.meta["cx"]
+                if "cx" in self.meta
+                else self.meta["frames"][0]["intrinsics"][0][2]
+            )
+            self.focal *= self.img_wh[0] / (
+                cx * 2
+            )  # modify focal length to match size self.img_wh
+
+        # bounds, common for all scenes
+        self.near = self.hparams.near / self.hparams.scale_factor
+        self.far = self.hparams.far / self.hparams.scale_factor
+        self.bounds = np.array([self.near, self.far])
+
+        # ray directions for all pixels, same for all images (same H, W, focal)
+        self.directions = get_ray_directions(h, w, self.focal)  # (h, w, 3)
+
+        self.direction_orig_norm = torch.norm(self.directions, dim=-1, keepdim=True)
+
+        # should use the same average pose for train and val split. so use all poses to center poses.
+        self.poses_all = self.gather_poses(self.meta_all["frames"])
+        self.poses_all, self.pose_avg = center_poses(self.poses_all[:, :3, :4])
+        self.poses_all[..., 3] /= self.hparams.scale_factor
+
+        val_idx = self.hparams.val_idx
+
+        if self.split == "train":  # create buffer of all rays and rgb data
+            # skip frames
+            self.meta["frames"] = [
+                self.meta["frames"][i]
+                for i in np.arange(
+                    0, len(self.meta["frames"]), self.hparams.train_skip_step
+                )
+            ]
+
+            self.image_paths = []
+            self.poses = []
+            self.all_rays = []
+            self.all_rgbs = []
+            self.all_mirror_masks = []
+            self.all_depths = []
+
+            self.rays_wmask = []
+            self.rgbs_wmask = []
+            self.mirror_masks_wmask = []
+            self.depths_wmask = []
+
+            len_frames = len(self.meta["frames"])
+            for idx, frame in enumerate(self.meta["frames"]):
+                print(
+                    "\rRead meta {:05d} : {:05d}".format(
+                        idx,
+                        len_frames - 1,
+                    ),
+                    end="",
+                )
+
+                sample = self.read_frame_data(frame, idx)
+
+                self.image_paths += [sample["image_path"]]
+                self.poses += [sample["pose"]]
+                self.all_rgbs += [sample["rgbs"]]
+                self.all_rays += [sample["rays"]]
+                self.all_mirror_masks += [sample["mirror_mask"]]
+
+                if (sample["mirror_mask"] < 0).any() == False:
+                    self.rgbs_wmask += [sample["rgbs"]]
+                    self.rays_wmask += [sample["rays"]]
+                    self.mirror_masks_wmask += [sample["mirror_mask"]]
+
+            self.poses = np.array(self.poses)
+            self.all_rays = torch.cat(
+                self.all_rays, 0
+            )  # (len(self.meta['frames])*h*w, 3)
+            self.all_rgbs = torch.cat(
+                self.all_rgbs, 0
+            )  # (len(self.meta['frames])*h*w, 3)
+            self.all_mirror_masks = torch.cat(
+                self.all_mirror_masks, 0
+            )  # (len(self.meta['frames])*h*w)
+            self.rays_wmask = torch.cat(self.rays_wmask, 0)
+            self.rgbs_wmask = torch.cat(self.rgbs_wmask, 0)
+            self.mirror_masks_wmask = torch.cat(self.mirror_masks_wmask, 0)
+
+        elif self.split == "val":
+            self.val_idx = val_idx
+        elif self.split == "test_rotate":
+            self.test_idx = val_idx
+            if "market" in self.hparams.root_dir:
+                self.test_idx = 77
+                self.poses_all[self.test_idx][2, 3] = (
+                    self.poses_all[self.test_idx][2, 3] - 0.3
+                )
+            self.meta["frames"] = []
+            test_num = 32
+            for i in range(test_num):
+                self.meta["frames"].append(
+                    {
+                        "transform_matrix": move_camera_pose_slightly(
+                            self.poses_all[self.test_idx], i / test_num
+                        )
+                    }
+                )
+        elif self.split == "test_interpolation":
+            c2ws = []
+            for idx, frame in enumerate(self.meta["frames"]):
+                pose = np.array(frame["transform_matrix"])
+                pose = center_pose_from_avg(self.pose_avg, pose)
+                pose[..., 3] /= self.hparams.scale_factor
+                c2w = pose[:3, :4]
+                c2ws.append(c2w.copy())
+            c2ws = np.stack(c2ws, axis=0)
+
+            from scipy.interpolate import interp1d
+            from scipy.spatial.transform import Slerp
+            from scipy.spatial.transform import Rotation as R
+
+            key_rots = R.from_matrix(c2ws[:, :3, :3])
+            key_times = list(range(len(key_rots)))
+            slerp = Slerp(key_times, key_rots)
+            interp = interp1d(key_times, c2ws[:, :3, 3], axis=0)
+
+            self.meta["frames"] = []
+            test_num = 64
+            for i in range(test_num):
+                time = float(i) / test_num * (len(c2ws) - 1)
+                cam_location = interp(time)
+                cam_rot = slerp(time).as_matrix()
+                c2w = np.eye(4)
+                c2w[:3, :3] = cam_rot
+                c2w[:3, 3] = cam_location
+                self.meta["frames"].append(
+                    {"transform_matrix": c2w.copy()}
+                )
+
+    def read_frame_data(self, frame, idx, no_data_when_test=False):
+        # read camera pose
+        pose = np.array(frame["transform_matrix"])
+
+        if not no_data_when_test:
+            pose = center_pose_from_avg(self.pose_avg, pose)
+            pose[..., 3] /= self.hparams.scale_factor
+
+        c2w = torch.FloatTensor(pose)[:3, :4]
+
+        # generate rays
+        rays_o, rays_d = get_rays(self.directions, c2w)  # both (h*w, 3)
+        rays = torch.cat(
+            [
+                rays_o,
+                rays_d,
+                self.near * torch.ones_like(rays_o[:, :1]),
+                self.far * torch.ones_like(rays_o[:, :1]),
+            ],
+            1,
+        )  # (H*W, 8)
+
+        if no_data_when_test:
+            sample = {
+                "rays": rays,
+                "c2w": c2w,
+                "pose": pose,
+            }
+        else:
+            # read image
+            image_path = os.path.join(self.root_dir, f"{frame['file_path']}")
+            if not os.path.exists(image_path):
+                print("Skip file which does not exist:", image_path)
+                return None
+            img = Image.open(image_path)
+            img = img.resize(self.img_wh, Image.LANCZOS)
+            img = self.transform(img)  # (c, h, w)
+            valid_mask = (img[-1] > 0).flatten()  # (H*W) valid color area
+            dim = img.shape[0]
+            img = img.view(dim, -1).permute(1, 0)  # (h*w, c)
+            if dim == 4:  # RGBA
+                img = img[:, :3] * img[:, -1:] + (1 - img[:, -1:])  # blend A to RGB
+
+            # read in mirror mask
+            img_file_name = os.path.split(frame["file_path"])[
+                -1
+            ]  # contain postfix ".jpg"
+            self.mirror_mask_dir = os.path.join(self.root_dir, "masks")
+            mirror_mask_path = os.path.join(self.mirror_mask_dir, img_file_name)
+            mirror_mask = cv2.imread(mirror_mask_path, cv2.IMREAD_ANYDEPTH)
+            if mirror_mask is None:
+                print(f"[warning] mirror_mask not exist:{mirror_mask_path}")
+                self.wo_full_gt_mirror_masks = True
+                # use -1 to mark invalid GT mirror mask
+                mirror_mask = np.ones((self.img_wh[1], self.img_wh[0])) * -1
+                mirror_mask = self.transform(mirror_mask)
+            else:
+                mirror_mask = cv2.resize(
+                    mirror_mask, self.img_wh, interpolation=cv2.INTER_NEAREST
+                )
+                mirror_mask = self.transform(mirror_mask)
+                mirror_mask[mirror_mask < 0.5] = 0
+                mirror_mask[mirror_mask > 0.5] = 1
+            mirror_mask = mirror_mask.squeeze()  # (H, W) # float
+            mirror_mask = mirror_mask.view(-1)  # (H*W)
+
+            sample = {
+                "rays": rays,
+                "rgbs": img,
+                "pose": pose,
+                "c2w": c2w,
+                "valid_mask": valid_mask,
+                "mirror_mask": mirror_mask,
+                "image_path": image_path,
+            }
+        return sample
+
+    def __len__(self):
+        if self.split == "train":
+            return (
+                len(self.rays_wmask)
+                if self.train_geometry_stage
+                else len(self.all_rays)
+            )
+        if self.split == "val":
+            return 1  # only validate 8 images (to support <=8 gpus)
+        return len(self.meta["frames"])
+
+    def __getitem__(self, idx):
+        if self.split == "train":  # use data in the buffers
+            if self.train_geometry_stage:
+                sample = {
+                    "rays": self.rays_wmask[idx],
+                    "rgbs": self.rgbs_wmask[idx],
+                    "mirror_mask": self.mirror_masks_wmask[idx],
+                }
+            else:
+                sample = {
+                    "rays": self.all_rays[idx],
+                    "rgbs": self.all_rgbs[idx],
+                    "mirror_mask": self.all_mirror_masks[idx],
+                }
+            sample["pix_idxs"] = idx % (self.img_wh[0] * self.img_wh[1])
+            sample["img_idxs"] = idx // (self.img_wh[0] * self.img_wh[1])
+        else:  # create data for each image separately
+            if self.split == "val":
+                idx = self.val_idx
+            frame = self.meta["frames"][idx]
+            sample = self.read_frame_data(
+                frame,
+                idx,
+                no_data_when_test=(
+                    self.split == "test_rotate"
+                    or self.split == "test_draw"
+                    or self.split == "test_interpolation"
+                ),
+            )
+
+        return sample
