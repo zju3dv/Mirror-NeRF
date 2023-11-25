@@ -99,7 +99,8 @@ The results of evaluation and application will be automatically stored in the `r
 @inproceedings{zeng2023mirror-nerf,
     title={Mirror-NeRF: Learning Neural Radiance Fields for Mirrors with Whitted-Style Ray Tracing},
     author={Zeng, Junyi and Bao, Chong and Chen, Rui and Dong, Zilong and Zhang, Guofeng and Bao, Hujun and Cui, Zhaopeng},
-    booktitle={Proceedings of the 31th ACM International Conference on Multimedia},
+    booktitle={Proceedings of the 31st ACM International Conference on Multimedia},
+    pages={4606--4615},
     year={2023}
 }
 ```
