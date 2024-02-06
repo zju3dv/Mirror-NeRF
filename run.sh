@@ -7,38 +7,40 @@ MODEL_TYPE="nerf"
 
 # # for datasets of synthetic scenes
 DATASET_NAME=blender
-BOUND=6
 
 DATASET=livingroom
-TRAIN_SKIP_STEP=2
-VAL_IDX=9
+TRAIN_SKIP_STEP=1
+VAL_IDX=0
 NEAR=0.05
 FAR=8.0
 IMAGE_W=400
 IMAGE_H=300
+BOUND=6
 
 # DATASET=washroom
-# TRAIN_SKIP_STEP=2
-# VAL_IDX=7
+# TRAIN_SKIP_STEP=1
+# VAL_IDX=0
 # NEAR=0.05
 # FAR=6.0
 # IMAGE_W=400
 # IMAGE_H=400
+# BOUND=6
 
 # DATASET=office
-# TRAIN_SKIP_STEP=3
-# VAL_IDX=14
+# TRAIN_SKIP_STEP=1
+# VAL_IDX=0
 # NEAR=0.05
 # FAR=6.0
 # IMAGE_W=400
 # IMAGE_H=400
+# BOUND=6
 
 
 # # for datasets of real scenes
 # DATASET_NAME=real_arkit
 
 # DATASET=discussion_room
-# TRAIN_SKIP_STEP=2
+# TRAIN_SKIP_STEP=1
 # VAL_IDX=0
 # NEAR=0.05
 # FAR=6.0
